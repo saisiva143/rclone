@@ -95,7 +95,7 @@ var (
 		"application/x-vnd.oasis.opendocument.text":         ".odt",
 		"image/jpg":   ".jpg",
 		"image/x-bmp": ".bmp",
-		"image/x-png": ".png",
+		"image/x-png": ".png",is:pr is:open
 		"text/rtf":    ".rtf",
 	}
 	_mimeTypeToExtension = map[string]string{

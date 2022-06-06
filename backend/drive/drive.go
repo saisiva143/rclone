@@ -12,11 +12,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"mime"
 	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -47,8 +49,9 @@ import (
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/jwt"
 	drive_v2 "google.golang.org/api/drive/v2"
-	drive "google.golang.org/api/drive/v3"
+	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
 
@@ -74,6 +77,7 @@ const (
 	listRGrouping    = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer = 1000 // size of input buffer when using ListR
 	defaultXDGIcon   = "text-html"
+	defaultDisable   = fs.Duration(1 * time.Hour)
 )
 
 // Globals
@@ -92,7 +96,7 @@ var (
 		"application/x-vnd.oasis.opendocument.text":         ".odt",
 		"image/jpg":   ".jpg",
 		"image/x-bmp": ".bmp",
-		"image/x-png": ".png",
+		"image/x-png": ".png",is:pr is:open
 		"text/rtf":    ".rtf",
 	}
 	_mimeTypeToExtension = map[string]string{
@@ -547,6 +551,20 @@ Google don't document so it may break in the future.
 `,
 			Advanced: true,
 		}, {
+			Name:     "service_account_folder",
+			Help:     "Use all files from the given folder as Service account file",
+			Advanced: true,
+		}, {
+			Name:     "account_disable_time",
+			Help:     "How long should an account be disabled when too many errors occur",
+			Value:    defaultDisable,
+			Advanced: true,
+		}, {
+			Name:     "multi_account_listing",
+			Help:     "Should multiple Accounts be used to accelerate listings",
+			Value:    false,
+			Advanced: true,
+		}, {
 			Name: "skip_shortcuts",
 			Help: `If set skip shortcut files.
 
@@ -626,6 +644,9 @@ type Options struct {
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
+	ServiceAccountFolder      string               `config:"service_account_folder"`
+	AccountDisableTime        fs.Duration          `config:"account_disable_time"`
+	MultiAccountListing       bool                 `config:"multi_account_listing"`
 }
 
 // Fs represents a remote drive server
@@ -717,6 +738,9 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	}
 	switch gerr := err.(type) {
 	case *googleapi.Error:
+		if gerr.Code == 400 { // Retry on Invalid Value
+			return true, err
+		}
 		if gerr.Code >= 500 && gerr.Code < 600 {
 			// All 5xx errors should be retried
 			return true, err
@@ -1050,17 +1074,69 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	}
 }
 
-func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData []byte) (*http.Client, error) {
+func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData []byte, ignoreImpersonate bool) (*jwt.Config, *http.Client, error) {
 	scopes := driveScopes(opt.Scope)
 	conf, err := google.JWTConfigFromJSON(credentialsData, scopes...)
 	if err != nil {
-		return nil, fmt.Errorf("error processing credentials: %w", err)
+		return nil, nil, errors.Wrap(err, "error processing credentials")
 	}
-	if opt.Impersonate != "" {
+	if opt.Impersonate != "" && !ignoreImpersonate {
 		conf.Subject = opt.Impersonate
 	}
 	ctxWithSpecialClient := oauthutil.Context(ctx, getClient(ctx, opt))
-	return oauth2.NewClient(ctxWithSpecialClient, conf.TokenSource(ctxWithSpecialClient)), nil
+	return conf, oauth2.NewClient(ctxWithSpecialClient, conf.TokenSource(ctxWithSpecialClient)), nil
+}
+
+func gatherServiceAccountCredentials(opt *Options) ([]string, error) {
+	if len(opt.ServiceAccountFolder) != 0 {
+		folder := os.ExpandEnv(path.Clean(opt.ServiceAccountFolder))
+		infos, err := ioutil.ReadDir(folder)
+		if err != nil {
+			return nil, errors.Wrap(err, "error opening service account credentials folder")
+		}
+
+		var files = make([]string, len(infos))
+		for i, info := range infos {
+			files[i] = path.Join(folder, info.Name())
+		}
+
+		if len(opt.ServiceAccountFile) == 0 {
+			opt.ServiceAccountFile = strings.Join(files, ",")
+		} else {
+			opt.ServiceAccountFile += "," + strings.Join(files, ",")
+		}
+	}
+
+	var serviceAccountCredentials []string
+	if len(opt.ServiceAccountFile) != 0 {
+		serviceAccountFiles := strings.Split(opt.ServiceAccountFile, ",")
+
+		for _, serviceAccountFile := range serviceAccountFiles {
+			var loadedCreds []byte
+			var err error
+
+			loadedCreds, err = base64.StdEncoding.DecodeString(serviceAccountFile)
+			if err != nil {
+				loadedCreds, err = ioutil.ReadFile(os.ExpandEnv(serviceAccountFile))
+			}
+
+			if err == nil && len(loadedCreds) == 0 {
+				err = errors.New("invalid service account file")
+			}
+
+			if err != nil {
+				return nil, errors.Wrap(err, "error opening service account credentials file")
+			}
+
+			serviceAccountCredentials = append(serviceAccountCredentials, string(loadedCreds))
+		}
+	}
+
+	if len(opt.ServiceAccountCredentials) != 0 {
+		serviceAccountCredentials = append(serviceAccountCredentials, opt.ServiceAccountCredentials)
+	}
+
+	return serviceAccountCredentials, nil
 }
 
 func createOAuthClient(ctx context.Context, opt *Options, name string, m configmap.Mapper) (*http.Client, error) {
@@ -1081,13 +1157,42 @@ func createOAuthClient(ctx context.Context, opt *Options, name string, m configm
 			return nil, fmt.Errorf("failed to create oauth client from service account: %w", err)
 		}
 	} else {
-		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
+		if s, ok := m.Get(config.ConfigToken); ok && len(s) > 0 {
+			oAuthClient, _, err := oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create oauth client: %w", err)
 		}
+
+		return oAuthClient, nil
 	}
 
-	return oAuthClient, nil
+	serviceAccountCredentials, err := gatherServiceAccountCredentials(opt)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(serviceAccountCredentials) == 1 {
+		_, oAuthClient, err := getServiceAccountClient(ctx, opt, []byte(opt.ServiceAccountCredentials), false)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create oauth client from service account")
+		}
+
+		return oAuthClient, nil
+	}
+
+	if len(serviceAccountCredentials) > 1 {
+		rotateRoundTripper, err := newRotateRoundTripper(ctx, opt, serviceAccountCredentials)
+
+		if err != nil {
+			return nil, err
+		}
+
+		return &http.Client{
+			Transport: rotateRoundTripper,
+		}, nil
+	}
+
+	return nil, errors.New("can't find an auth source")
 }
 
 func checkUploadChunkSize(cs fs.SizeSuffix) error {
